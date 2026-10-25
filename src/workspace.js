@@ -4,7 +4,7 @@
  * Replace this object to run the loop on a non-git workspace.
  */
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -32,6 +32,8 @@ export async function git(cwd, args, env, signal) {
 export function gitWorkspace(cwd) {
   const root = resolve(cwd);
   const refs = [];
+  // snapshot commit -> commit that also holds gitignored files, for the prosecutor boundary
+  const withIgnored = new Map();
   let queue = Promise.resolve();
   const lock = (fn) => {
     const run = queue.then(fn, fn);
@@ -42,6 +44,9 @@ export function gitWorkspace(cwd) {
   async function withIndex(fn) {
     return lock(async () => {
       const dir = await mkdtemp(join(tmpdir(), "prosecutor-index-"));
+      // Seed from the real index so git reuses its stat cache instead of re-hashing the tree.
+      const real = await git(root, ["rev-parse", "--git-path", "index"]);
+      if (real.ok) await copyFile(resolve(root, real.out), join(dir, "index")).catch(() => {});
       const env = {
         GIT_INDEX_FILE: join(dir, "index"),
         GIT_AUTHOR_NAME: "prosecutor-mode",
@@ -50,18 +55,32 @@ export function gitWorkspace(cwd) {
         GIT_COMMITTER_EMAIL: "prosecutor-mode@localhost",
       };
       try {
-        return await fn(env);
+        return await fn(env, dir);
       } finally {
         await rm(dir, { recursive: true, force: true });
       }
     });
   }
 
-  async function diff(commit, pathspecs, extra, signal) {
+  // ponytail: ignored dirs named node_modules are skipped and other ignored files are hashed every
+  // snapshot; edits there (and anywhere outside the repo) go undetected. Add a size cap if dist/ gets huge.
+  async function addIgnored(env, dir, signal) {
+    const listed = await git(root, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"], env, signal);
+    if (!listed.ok) return false;
+    const paths = listed.out.split("\0").filter((path) => path && !path.split("/").includes("node_modules"));
+    if (!paths.length) return true;
+    const file = join(dir, "ignored");
+    await writeFile(file, paths.join("\0"));
+    const added = await git(root, ["add", "-f", `--pathspec-from-file=${file}`, "--pathspec-file-nul"], env, signal);
+    return added.ok;
+  }
+
+  async function diff(commit, pathspecs, extra, signal, ignored = false) {
     if (!commit) return null;
-    return withIndex(async (env) => {
+    return withIndex(async (env, dir) => {
       const staged = await git(root, ["add", "-A"], env, signal);
       if (!staged.ok) return null;
+      if (ignored && !(await addIgnored(env, dir, signal))) return null;
       const args = ["diff", "--cached", "--no-renames", ...extra, commit];
       if (pathspecs.length) args.push("--", ...pathspecs);
       const result = await git(root, args, env, signal);
@@ -72,7 +91,7 @@ export function gitWorkspace(cwd) {
   return {
     cwd: root,
     async snapshot(label) {
-      return withIndex(async (env) => {
+      return withIndex(async (env, dir) => {
         const staged = await git(root, ["add", "-A"], env);
         if (!staged.ok) return { ok: false, error: staged.error || "git add failed" };
         const tree = await git(root, ["write-tree"], env);
@@ -87,6 +106,16 @@ export function gitWorkspace(cwd) {
         const ref = `refs/prosecutor-mode/${commit.out}`;
         const updated = await git(root, ["update-ref", ref, commit.out]);
         if (updated.ok) refs.push(ref);
+        if (await addIgnored(env, dir)) {
+          const full = await git(root, ["write-tree"], env);
+          const kept = full.ok && full.out !== tree.out
+            ? await git(root, ["commit-tree", full.out, "-p", commit.out, "-m", "prosecutor-mode: ignored files"], env)
+            : { ok: false };
+          if (kept.ok && (await git(root, ["update-ref", `refs/prosecutor-mode/${kept.out}`, kept.out])).ok) {
+            refs.push(`refs/prosecutor-mode/${kept.out}`);
+            withIgnored.set(commit.out, kept.out);
+          }
+        }
         return { ok: true, commit: commit.out, ref };
       });
     },
@@ -97,7 +126,8 @@ export function gitWorkspace(cwd) {
       return diff(commit, [], ["-U0"], signal);
     },
     async prosecutorChanges(commit, patterns, signal) {
-      const status = await diff(commit, [], ["--name-status"], signal);
+      const full = withIgnored.get(commit);
+      const status = await diff(full ?? commit, [], ["--name-status"], signal, true);
       if (status == null) return null;
       const tests = [];
       const breach = [];
@@ -105,7 +135,8 @@ export function gitWorkspace(cwd) {
         (isTestPath(change.path, patterns) ? tests : breach).push(change);
       return { tests, breach };
     },
-    async revertChanges(commit, changes) {
+    async revertChanges(snapshot, changes) {
+      const commit = withIgnored.get(snapshot) ?? snapshot;
       const list = (changes ?? []).filter((change) => isRepoPath(change.path));
       const restore = list.filter((change) => change.status !== "A").map((change) => change.path);
       if (restore.length) {

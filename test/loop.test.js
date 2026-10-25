@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createSameModel, runCase } from "../src/index.js";
+import { createSameModel, gitWorkspace, runCase } from "../src/index.js";
 import { act } from "./fixtures/act.mjs";
 import { makeRepo, sh } from "./repo.mjs";
 
@@ -211,3 +211,52 @@ test("requireGate refuses an acquittal when no commands were configured", async 
   }
 });
 
+
+test("a prosecutor that edits gitignored files is reverted", async () => {
+  const repo = await makeRepo();
+  try {
+    await writeFile(join(repo.cwd, ".gitignore"), ".env\ndist/\n");
+    repo.git("add", ".gitignore");
+    repo.git("commit", "-m", "ignore");
+    await writeFile(join(repo.cwd, ".env"), "SECRET=1\n");
+    let calls = 0;
+    const result = await runCase({
+      cwd: repo.cwd,
+      task: "leave the tree alone",
+      executor: async () => "implemented",
+      prosecutor: async () => {
+        calls += 1;
+        await writeFile(join(repo.cwd, ".env"), "SECRET=hacked\n");
+        await mkdir(join(repo.cwd, "dist"), { recursive: true });
+        await writeFile(join(repo.cwd, `dist/evil${calls}.js`), "nope\n");
+        return "VERDICT: GUILTY";
+      },
+    });
+    assert.equal(result.status, "stopped");
+    assert.match(result.reason, /\.env/);
+    assert.equal(await readFile(join(repo.cwd, ".env"), "utf8"), "SECRET=1\n");
+    assert.equal(await exists(join(repo.cwd, "dist/evil1.js")), false);
+    assert.equal(await exists(join(repo.cwd, "dist/evil2.js")), false);
+  } finally {
+    await repo.destroy();
+  }
+});
+
+test("snapshots leave the user's real index alone", async () => {
+  const repo = await makeRepo();
+  try {
+    await writeFile(join(repo.cwd, "staged.txt"), "staged\n");
+    repo.git("add", "staged.txt");
+    await writeFile(join(repo.cwd, "loose.txt"), "loose\n");
+    const index = await readFile(join(repo.cwd, ".git/index"));
+    const workspace = gitWorkspace(repo.cwd);
+    const snap = await workspace.snapshot("test");
+    await writeFile(join(repo.cwd, "loose.txt"), "changed\n");
+    assert.match(await workspace.changedSince(snap.commit), /M\tloose\.txt/);
+    assert.deepEqual(await readFile(join(repo.cwd, ".git/index")), index);
+    assert.equal(repo.git("diff", "--cached", "--name-only").trim(), "staged.txt");
+    await workspace.close();
+  } finally {
+    await repo.destroy();
+  }
+});

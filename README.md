@@ -30,13 +30,13 @@ FINDING F1 | requirement: "the task words" | test: file:line name | command: <ho
 
 That `command` is recorded and **never executed**. Only `gate` commands run, and you supply those.
 
-The prosecutor may only add or edit test files (`**/*.test.*`, `**/*.spec.*`, `**/__tests__/**`, `test/**`, `tests/**`, and the same under any directory). Any other edit is reverted and the round is void. A second breach stops the case. The executor may not edit or delete those tests. If it does, it gets one chance to put them back; then the loop restores them and stops.
+The prosecutor may only add or edit test files (`**/*.test.*`, `**/*.spec.*`, `**/__tests__/**`, `test/**`, `tests/**`, and the same under any directory). Any other edit inside the repo is reverted and the round is void. That includes gitignored files such as `.env` or `dist/`, but not ignored `node_modules/` directories or anything outside the repo; run the prosecutor in a sandbox if those matter. A second breach stops the case. The executor may not edit or delete those tests. If it does, it gets one chance to put them back; then the loop restores them and stops.
 
 An acquittal is `verified: true` only after every gate command exits 0 and leaves the tree unchanged. With no gate, the case is `accepted` and `verified: false`. Pass `requireGate: true` to refuse that.
 
 ## CLI
 
-From a git checkout (macOS or Linux, Node 22, `git` on `PATH`):
+From a git checkout (Node 22, `git` on `PATH`). macOS and Linux only: sides and gate commands run under `/bin/sh` in their own process group.
 
 ```bash
 node bin/prosecute.mjs \
@@ -63,7 +63,16 @@ Stdout is a JSON summary. Exit 0 means `status` is `accepted`. Read `verified` b
 
 The one-shot process's cwd is the workspace. The prompt is on stdin. These environment variables are set too: `PROSECUTOR_ROLE`, `PROSECUTOR_ROUND`, `PROSECUTOR_CWD`, `PROSECUTOR_EFFORT`, `PROSECUTOR_MODEL`. `{prompt}`, `{role}`, `{model}`, `{cwd}`, and `{round}` work inside `--arg`. Prefer stdin for the prompt; argv has a size limit.
 
-`--prompt-via json` writes one turn object to stdin instead of the raw prompt. `--stdio` keeps a single process open for both roles.
+`--prompt-via json` writes one turn object to stdin instead of the raw prompt. The reply is read from the last JSON line's `text`, or its `result` (`claude -p --output-format json` works). `--stdio` keeps a single process open for both roles.
+
+One-shot turns start cold: every round re-sends the case brief, so prompt cost grows with each round. Use `--stdio` or `brief: "first"` with a harness that keeps its own transcript.
+
+| CLI | Args | Prompt |
+| --- | --- | --- |
+| Claude Code | `--cmd claude --arg -p --arg --dangerously-skip-permissions` | stdin |
+| Codex | `--cmd codex --arg exec --arg --sandbox --arg workspace-write` | stdin |
+| Grok | `--cmd grok --arg -p --arg '{prompt}'` | argv only |
+| opencode | `--cmd opencode --arg run --arg '{prompt}'` | argv only |
 
 ## Library
 

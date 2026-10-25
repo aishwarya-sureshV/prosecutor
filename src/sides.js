@@ -60,9 +60,21 @@ function fillArgs(args, ctx) {
   );
 }
 
+const replyOf = (message) =>
+  typeof message?.text === "string" ? message.text : typeof message?.result === "string" ? message.result : null;
+
 function readReply(stdout, promptVia) {
   const text = String(stdout ?? "");
-  if (promptVia !== "json") return text;
+  if (promptVia !== "json") {
+    // `claude -p --output-format json` prints a single {"type":"result","result":"..."} object.
+    try {
+      const message = JSON.parse(text);
+      if (message?.type === "result" && typeof message.result === "string") return message.result;
+    } catch {
+      /* plain text */
+    }
+    return text;
+  }
   const line = text.trim().split("\n").findLast((item) => item.trim().startsWith("{"));
   if (!line) return text;
   try {
@@ -72,7 +84,7 @@ function readReply(stdout, promptVia) {
       error.side = true;
       throw error;
     }
-    if (message.type === "result" || typeof message.text === "string") return String(message.text ?? "");
+    if (message.type === "result" || replyOf(message) != null) return replyOf(message) ?? "";
   } catch (error) {
     if (error?.side) throw error;
   }
@@ -176,8 +188,6 @@ export function createCliSide({
 export function createStdioHarness({ command, args = [], env = {}, cwd, timeoutMs = 20 * 60_000 } = {}) {
   if (!command || typeof command !== "string") throw new TypeError("createStdioHarness requires a command");
   let child = null;
-  let buffer = "";
-  const decoder = new StringDecoder("utf8");
   const waiters = new Map();
   let seq = 0;
   let chain = Promise.resolve();
@@ -208,14 +218,23 @@ export function createStdioHarness({ command, args = [], env = {}, cwd, timeoutM
 
   function ensure(startCwd) {
     if (child && child.exitCode == null && child.signalCode == null) return child;
-    buffer = "";
-    child = spawn(command, args, {
+    const proc = spawn(command, args, {
       cwd: cwd || startCwd,
       env: { ...process.env, ...env },
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    child.stdout.on("data", (chunk) => {
+    child = proc;
+    let buffer = "";
+    let stderr = "";
+    const decoder = new StringDecoder("utf8");
+    const fail = (message) => {
+      if (child !== proc) return;
+      child = null;
+      failAll(stderr.trim() ? `${message}: ${stderr.trim()}` : message);
+    };
+    proc.stdout.on("data", (chunk) => {
+      if (child !== proc) return;
       buffer += decoder.write(chunk);
       let nl;
       while ((nl = buffer.indexOf("\n")) >= 0) {
@@ -224,11 +243,23 @@ export function createStdioHarness({ command, args = [], env = {}, cwd, timeoutM
         onLine(line);
       }
     });
-    child.stderr.on("data", () => {});
-    child.on("error", () => failAll("harness failed to start"));
-    child.on("close", () => failAll("harness exited"));
-    child.stdin.on("error", () => {});
-    return child;
+    proc.stderr.on("data", (chunk) => {
+      const piece = chunk.toString("utf8");
+      stderr = (stderr + piece).slice(-TAIL);
+      for (const waiter of waiters.values()) waiter.onEvent?.({ type: "stderr", text: piece });
+    });
+    proc.on("error", () => fail("harness failed to start"));
+    proc.on("close", () => fail("harness exited"));
+    proc.stdin.on("error", () => {});
+    return proc;
+  }
+
+  // A turn that timed out or was aborted may still be editing files: kill it so the next turn starts clean.
+  function restart(message) {
+    const current = child;
+    child = null;
+    failAll(message);
+    killTree(current);
   }
 
   function turn(ctx) {
@@ -255,11 +286,14 @@ export function createStdioHarness({ command, args = [], env = {}, cwd, timeoutM
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         waiters.delete(id);
+        ctx.signal?.removeEventListener("abort", onAbort);
+        restart("harness restarted after a timed-out turn");
         reject(new Error(`stdio turn timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       const onAbort = () => {
         clearTimeout(timer);
         waiters.delete(id);
+        restart("harness restarted after an aborted turn");
         reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
       };
       ctx.signal?.addEventListener("abort", onAbort, { once: true });
@@ -280,10 +314,7 @@ export function createStdioHarness({ command, args = [], env = {}, cwd, timeoutM
     executor: turn,
     prosecutor: turn,
     close() {
-      failAll("harness closed");
-      const current = child;
-      child = null;
-      if (current) killTree(current);
+      restart("harness closed");
     },
   };
 }

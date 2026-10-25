@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
@@ -90,6 +90,52 @@ test("the CLI accepts a case from one command and rejects a missing task", async
     );
     assert.equal(missing.code, 1);
     assert.match(missing.stderr, /--task/);
+  } finally {
+    await repo.destroy();
+  }
+});
+
+test("a timed-out stdio turn kills the harness, the next turn gets a fresh one, and stderr is kept", async () => {
+  const repo = await makeRepo();
+  const harness = createStdioHarness({ command: process.execPath, args: [fixture("hang-stdio.mjs")], cwd: repo.cwd, timeoutMs: 200 });
+  const ctx = (prompt, onEvent) => ({ role: "executor", round: 0, prompt, cwd: repo.cwd, task, onEvent });
+  try {
+    const first = await harness.executor(ctx("ping"));
+    await assert.rejects(harness.executor(ctx("hang")), /timed out/);
+    const second = await harness.executor(ctx("ping"));
+    assert.notEqual(second.text, first.text);
+    await new Promise((done) => setTimeout(done, 800));
+    await assert.rejects(access(join(repo.cwd, "late.txt")));
+    const events = [];
+    await assert.rejects(harness.executor(ctx("die", (event) => events.push(event))), /harness exited: boom from harness/);
+    assert.ok(events.some((event) => event.type === "stderr" && /boom/.test(event.text)));
+  } finally {
+    harness.close();
+    await repo.destroy();
+  }
+});
+
+test("JSON replies are read from text or from a Claude Code style result", async () => {
+  const run = (promptVia, out) =>
+    createCliSide({ command: process.execPath, args: ["-e", `process.stdout.write(${JSON.stringify(out)})`], promptVia })({
+      role: "executor", round: 0, prompt: "", cwd: process.cwd(), task,
+    });
+  const result = JSON.stringify({ type: "result", subtype: "success", result: "VERDICT: ACQUITTED" });
+  assert.equal(await run("json", result), "VERDICT: ACQUITTED");
+  assert.equal(await run("json", JSON.stringify({ type: "result", text: "t", result: "r" })), "t");
+  assert.equal(await run("stdin", result), "VERDICT: ACQUITTED");
+  assert.equal(await run("stdin", '{"a":1}'), '{"a":1}');
+});
+
+test("the CLI passes long flags through --arg", async () => {
+  const repo = await makeRepo();
+  try {
+    const { stdout } = await exec(process.execPath, [
+      bin, "--cwd", repo.cwd, "--task", task,
+      "--cmd", process.execPath, "--arg", fixture("fake-agent.mjs"), "--arg", "--some-flag",
+      "--gate", gate,
+    ], { timeout: 30_000 });
+    assert.equal(JSON.parse(stdout).verified, true);
   } finally {
     await repo.destroy();
   }
