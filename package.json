@@ -1,0 +1,25 @@
+{
+  "name": "prosecutor",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Harness-agnostic prosecutor and executor loop. The same model can play both sides.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "bin": {
+    "prosecute": "./bin/prosecute.mjs"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
